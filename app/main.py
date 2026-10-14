@@ -1432,18 +1432,16 @@ def explain_endpoint(
             "explain": query,
             "verbosity": "executionStats",
         })
-
+        
         execution_stats = plan.get("executionStats", {})
         query_planner = plan.get("queryPlanner", {})
 
-        if not execution_stats and not query_planner:
-            stages = plan.get("stages", [])
-            for stage in stages:
-                cursor = stage.get("$cursor", {})
-                if cursor:
-                    execution_stats = cursor.get("executionStats", {})
-                    query_planner = cursor.get("queryPlanner", {})
-                    break
+        for stage in plan.get("stages", []):
+            cursor = stage.get("$cursor", {})
+            if cursor:
+                execution_stats = cursor.get("executionStats", execution_stats)
+                query_planner = cursor.get("queryPlanner", query_planner)
+                break
 
         return {
             "endpoint": endpoint,
