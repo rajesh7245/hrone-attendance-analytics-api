@@ -879,6 +879,7 @@ def late_leaderboard(
 
 # ---------- Department daily trend ----------
 
+
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(
     department: str,
@@ -893,6 +894,7 @@ def department_trend(
             status_code=422,
             detail="to must be on or after from",
         )
+
     if (end - start).days > 91:
         raise HTTPException(
             status_code=422,
@@ -902,7 +904,6 @@ def department_trend(
     if not db.employees.find_one({"department": department}):
         raise HTTPException(status_code=404, detail="Department not found")
 
-    # Aggregate existing daily records in MongoDB.
     pipeline = [
         {"$match": {
             "date": {
@@ -922,19 +923,11 @@ def department_trend(
             "_id": "$date",
             "present_count": {"$sum": {
                 "$cond": [
-                    {"$and": [
-                        {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                        {"$eq": ["$half_day", False]},
-                    ]},
-                    1,
+                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
                     {"$cond": [
-                        {"$and": [
-                            {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                            {"$eq": ["$half_day", True]},
-                        ]},
-                        0.5,
-                        0,
+                        {"$eq": ["$half_day", True]}, 0.5, 1
                     ]},
+                    0,
                 ]
             }},
             "late_count": {"$sum": {
@@ -943,67 +936,113 @@ def department_trend(
         }},
         {"$project": {
             "_id": 0,
-            "date": "$_id",
+            "date": {"$dateFromString": {
+                "dateString": "$_id",
+            }},
             "present_count": 1,
             "late_count": 1,
+        }},
+        {"$densify": {
+            "field": "date",
+            "range": {
+                "step": 1,
+                "unit": "day",
+                "bounds": [
+                    datetime.combine(start, datetime.min.time()),
+                    datetime.combine(end, datetime.min.time()),
+                ],
+            },
+        }},
+        {"$set": {
+            "date": {"$dateToString": {
+                "format": "%Y-%m-%d",
+                "date": "$date",
+                "timezone": "UTC",
+            }},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$set": {
+            "is_working_day": {
+                "$lt": [
+                    {"$isoDayOfWeek": {
+                        "$dateFromString": {"dateString": "$date"}
+                    }},
+                    6,
+                ]
+            },
+        }},
+        {"$lookup": {
+            "from": "employees",
+            "let": {"day": "$date"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$department", department]},
+                    {"$lte": ["$joined_on", "$$day"]},
+                ]}}},
+                {"$count": "count"},
+            ],
+            "as": "headcount_result",
+        }},
+        {"$set": {
+            "headcount": {
+                "$ifNull": [
+                    {"$arrayElemAt": ["$headcount_result.count", 0]},
+                    0,
+                ]
+            },
+        }},
+        {"$set": {
+            "attendance_rate": {
+                "$cond": [
+                    {"$and": [
+                        "$is_working_day",
+                        {"$gt": ["$headcount", 0]},
+                    ]},
+                    {"$round": [
+                        {"$divide": ["$present_count", "$headcount"]},
+                        4,
+                    ]},
+                    None,
+                ]
+            },
+        }},
+        {"$setWindowFields": {
+            "sortBy": {"date": 1},
+            "output": {
+                "moving_avg_7d": {
+                    "$avg": "$attendance_rate",
+                    "window": {"documents": [-6, 0]},
+                },
+            },
+        }},
+        {"$project": {
+            "_id": 0,
+            "date": 1,
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate": 1,
+            "moving_avg_7d": {"$round": ["$moving_avg_7d", 4]},
         }},
         {"$sort": {"date": 1}},
     ]
 
-    # Keep the pipeline output keyed by date. Missing calendar dates
-    # are added below so the response includes weekends and no-record days.
-    daily = {
-        row["date"]: row
-        for row in db.attendance_logs.aggregate(pipeline)
-    }
-
-    output = []
-    rates = []
-    current = start
-
-    while current <= end:
-        day = current.isoformat()
-        working_day = current.weekday() < 5
-        headcount = db.employees.count_documents({
-            "department": department,
-            "joined_on": {"$lte": day},
-        })
-        row = daily.get(day, {})
-        present = row.get("present_count", 0)
-        late = row.get("late_count", 0)
-
-        rate = (
-            rounded_rate(present / headcount)
-            if working_day and headcount > 0 else None
+    try:
+        items = list(db.attendance_logs.aggregate(pipeline))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Department trend aggregation failed: {str(exc)}",
         )
-        rates.append(rate)
-
-        valid_rates = [
-            value for value in rates[-7:] if value is not None
-        ]
-        moving_average = (
-            rounded_rate(sum(valid_rates) / len(valid_rates))
-            if valid_rates else None
-        )
-
-        output.append({
-            "date": day,
-            "is_working_day": working_day,
-            "headcount": headcount,
-            "present_count": present,
-            "late_count": late,
-            "attendance_rate": rate,
-            "moving_avg_7d": moving_average,
-        })
-        current += timedelta(days=1)
 
     return {
         "department": department,
         "from": from_date,
         "to": to_date,
-        "items": output,
+        "items": items,
     }
-
 
 # ---------- Query-plan diagnostics ----------
 
